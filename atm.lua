@@ -1,20 +1,34 @@
 -- ==========================================
--- HANEDANOGULLARI ATM SISTEMI (v2 - Smart Chute)
+-- HANEDANOGULLARI ATM SISTEMI (v3)
 -- Fiziksel item <-> Dijital bakiye koprusu
 --
--- KURULUM: [Bilgisayar] -> [Sandik] -> Smart Chute (redstone kontrollu) -> [Kasa]
--- Smart Chute normalde KAPALI (redstone sinyali VAR).
--- Para yatirma sirasinda kisa sureligine ACILIR (redstone sinyali YOK),
--- itemler Kasa'ya akar, sonra tekrar KAPANIR.
--- Boylece akis tamamen kontrollu, dupe riski yok.
+-- FIZIKSEL KURULUM:
+-- [Bilgisayar] -> [Sandik] -> Smart Chute 1 (redstone) -> [Kasa] -> Smart Chute 2 (redstone) -> [Hazine]
+--
+-- AKIS:
+-- 1) Kullanici giris yapar
+-- 2) "Para Yatir" secer
+-- 3) Ekranda "itemleri sandiga at" yazar, Chute 1 ACILIR
+-- 4) 6 saniye boyunca acik kalir (itemler Sandik -> Kasa akar)
+-- 5) Chute 1 KAPANIR, Kasa'daki miktar SAYILIR, bakiyeye eklenir
+-- 6) Chute 2 ACILIR, 10 saniye boyunca Kasa'daki itemler Hazine'ye akar
+-- 7) Chute 2 KAPANIR, Kasa artik BOS, bir sonraki islem icin hazir
 -- ==========================================
 
 local PROTOCOL = "j7yq39j4gwpoku9h38w409geoTYUHIJ9u0UR-troglfd-2847"
 local MODEM_SIDE = "back" -- ATM'nin modemi arkada
 local BANK_ID = 0 -- Merkez Banka ID'si, kendi kurulumuna gore ayarla
-local KASA_SIDE = "bottom" -- Kasa'nin (Smart Chute'un ALTINDAKI depo) bilgisayara gore yonu
-local REDSTONE_SIDE = "right" -- Smart Chute'a giden redstone sinyalinin cikis yonu
-local DEPOSIT_DURATION = 6 -- kac saniye boyunca chute acik kalsin
+local KASA_SIDE = "bottom" -- Kasa'nin (ilk Smart Chute'un altindaki gecici depo) bilgisayara gore yonu
+
+-- REDSTONE CIKISLARI
+-- Eger her iki Smart Chute da AYNI yonden (sagdan) kontrol ediliyorsa,
+-- bu iki chute'u AYRI redstone hatlariyla kontrol etmen gerekiyor.
+-- Ornegin: Chute 1 icin "right", Chute 2 icin "left" gibi FARKLI yonler kullan.
+local CHUTE1_REDSTONE_SIDE = "right" -- Sandik -> Kasa arasindaki chute
+local CHUTE2_REDSTONE_SIDE = "left"  -- Kasa -> Hazine arasindaki chute, FARKLI bir yon olmali
+
+local DEPOSIT_DURATION = 6  -- para koyma suresi (saniye)
+local WITHDRAW_DURATION = 10 -- Kasa'yi Hazine'ye bosaltma suresi (saniye)
 
 rednet.open(MODEM_SIDE)
 
@@ -37,16 +51,14 @@ local ITEM_VALUES = {
 -- CHUTE KONTROLU
 -- ==========================================
 
-local function closeChute()
-  redstone.setOutput(REDSTONE_SIDE, true) -- sinyal VAR = Smart Chute KAPALI
-end
+local function closeChute1() redstone.setOutput(CHUTE1_REDSTONE_SIDE, true) end
+local function openChute1()  redstone.setOutput(CHUTE1_REDSTONE_SIDE, false) end
+local function closeChute2() redstone.setOutput(CHUTE2_REDSTONE_SIDE, true) end
+local function openChute2()  redstone.setOutput(CHUTE2_REDSTONE_SIDE, false) end
 
-local function openChute()
-  redstone.setOutput(REDSTONE_SIDE, false) -- sinyal YOK = Smart Chute ACIK
-end
-
--- baslangicta chute'un kapali oldugundan emin ol
-closeChute()
+-- baslangicta ikisi de kapali olsun
+closeChute1()
+closeChute2()
 
 -- ==========================================
 -- KASA SAYIMI
@@ -92,6 +104,15 @@ local function clearScreen()
   term.setCursorPos(1,1)
 end
 
+local function countdown(seconds, label)
+  for i = seconds, 1, -1 do
+    term.setCursorPos(1, select(2, term.getCursorPos()))
+    write(label .. ": " .. i .. " saniye...   ")
+    sleep(1)
+  end
+  print("")
+end
+
 local function depositScreen()
   clearScreen()
   print("==========================================")
@@ -114,39 +135,35 @@ local function depositScreen()
     return
   end
 
-  -- yatirma oncesi Kasa'daki mevcut degeri kaydet (referans noktasi)
-  local beforeValue, _ = countKasa()
-
   print("")
   print("Giris basarili, hosgeldin " .. username .. "!")
   print("")
-  print("Simdi itemleri sandiga at! Chute " .. DEPOSIT_DURATION .. " saniye acik kalacak.")
+  print(">>> ITEMLERI SIMDI SANDIGA AT <<<")
   print("")
 
-  openChute()
-
-  for i = DEPOSIT_DURATION, 1, -1 do
-    term.setCursorPos(1, select(2, term.getCursorPos()))
-    write("Kalan sure: " .. i .. " saniye...   ")
-    sleep(1)
-  end
-
-  closeChute()
-  sleep(0.5) -- chute'un kapanip son itemlerin de dusmesi icin kisa bekleme
+  -- ADIM 1: Chute 1 ac, itemler Sandik'tan Kasa'ya aksin
+  openChute1()
+  countdown(DEPOSIT_DURATION, "Koyma suresi")
+  closeChute1()
+  sleep(0.5) -- son itemlerin de dusmesi icin kisa bekleme
 
   print("")
-  print("Chute kapatildi, sayiliyor...")
-
-  local afterValue, afterItems = countKasa()
-  local totalValue = afterValue - beforeValue
+  print("Sayiliyor...")
+  local totalValue, itemsFound = countKasa()
 
   if totalValue <= 0 then
     print("")
-    print("Yeni item algilanmadi, islem iptal edildi.")
+    print("Kasa'da gecerli item bulunamadi, islem iptal edildi.")
     print("Kabul edilen itemler:")
     for name, value in pairs(ITEM_VALUES) do
       print("  " .. name .. " = " .. value .. " birim")
     end
+    -- yine de Kasa'yi bosalt, icinde gecersiz item kalmasin
+    print("")
+    print("Kasa temizleniyor...")
+    openChute2()
+    countdown(WITHDRAW_DURATION, "Temizleme suresi")
+    closeChute2()
     print("")
     print("(devam etmek icin tusa bas)")
     os.pullEvent("key")
@@ -154,8 +171,14 @@ local function depositScreen()
   end
 
   print("")
+  print("Kasa'da bulunan degerli itemler:")
+  for _, item in ipairs(itemsFound) do
+    print("  " .. item.name .. " x" .. item.count .. " = " .. item.value .. " birim")
+  end
+  print("")
   print("YATIRILAN DEGER: " .. totalValue .. " birim")
 
+  -- ADIM 2: bakiyeyi guncelle
   local newBalance = loginResp.balance + totalValue
   local setResp = sendToBank({action = "admin_setbalance", username = username, amount = newBalance})
 
@@ -165,10 +188,19 @@ local function depositScreen()
     print("Yeni bakiye: " .. newBalance .. " birim")
   else
     print("")
-    print("!!! KRITIK HATA: Itemler alindi ama bakiye guncellenemedi !!!")
+    print("!!! KRITIK HATA: Itemler sayildi ama bakiye guncellenemedi !!!")
     print("Bu durumu hemen admin'e bildir, manuel duzeltme gerekebilir.")
   end
 
+  -- ADIM 3: Kasa'yi Hazine'ye bosalt (Chute 2)
+  print("")
+  print(">>> KASA HAZINEYE BOSALTILIYOR <<<")
+  openChute2()
+  countdown(WITHDRAW_DURATION, "Bosaltma suresi")
+  closeChute2()
+
+  print("")
+  print("Islem tamamlandi, Kasa bosaltildi.")
   print("")
   print("(devam etmek icin tusa bas)")
   os.pullEvent("key")
@@ -208,7 +240,8 @@ local function mainMenu()
     elseif choice == "2" then
       withdrawScreen()
     elseif choice == "3" then
-      closeChute() -- guvenlik: cikista chute'un kapali oldugundan emin ol
+      closeChute1()
+      closeChute2()
       break
     end
   end
