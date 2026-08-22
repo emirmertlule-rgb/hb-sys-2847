@@ -54,40 +54,94 @@ local function countDepositValue()
   return totalValue, itemsFound
 end
 
--- GUVENLIK KRITIK: Bu fonksiyon, itemleri SAYMADAN ONCE degil,
--- SAYARKEN AYNI ANDA banka deposuna tasir. Boylece oyuncunun
--- "bakiye eklendi, simdi itemi geri alayim" yapmasi imkansiz olur.
--- VAULT_SIDE: itemlerin tasinacagi guvenli banka deposunun yonu
-local VAULT_SIDE = "bottom" -- kendi kurulumuna gore ayarla, ATM sandiginin ALTINDA/yaninda guvenli bir depo olmali
+-- SENIN KURULUMUN: [Bilgisayar] -> [Sandik] -> Chute -> Belt -> [Kasa]
+-- Chute ve Belt itemleri ZATEN OTOMATIK olarak Kasa'ya tasiyor.
+-- Kod hicbir sey tasimiyor, SADECE KASA'YI OKUYUP SAYIYOR.
+-- KASA_SIDE: bilgisayarin, Kasa'yi (son nokta) hangi yonden gordugu.
+-- Eger Kasa bilgisayara dogrudan bagli degilse (araya Belt/baska blok giriyorsa),
+-- bir Wired Modem ile Kasa'ya ayrica baglanman gerekebilir - bu durumda
+-- KASA_SIDE yerine peripheral.getNames() ile bulunan ismi kullan.
+local KASA_SIDE = "bottom" -- kendi kurulumuna gore ayarla
 
-local function depositAndMoveItems()
-  local chest = getChest()
-  if not chest then return 0, {} end
+-- Onceki sayimda Kasa'da olanlari hatirlamak icin (kumulatif fark hesaplamak yerine,
+-- her seferinde Kasa'yi TAMAMEN BOSALTARAK sayiyoruz - en guvenli yontem)
+local function countAndClearKasa()
+  local kasa = peripheral.wrap(KASA_SIDE)
+  if not kasa then return 0, {} end
 
-  local items = chest.list()
+  local items = kasa.list()
   local totalValue = 0
   local itemsFound = {}
 
   for slot, item in pairs(items) do
     local value = ITEM_VALUES[item.name]
     if value then
-      -- pushItems tek seferde max 64 (bir stack) tasiyor,
-      -- slot tamamen bosalana kadar dongu ile devam ediyoruz
-      local totalMoved = 0
-      while true do
-        local moved = chest.pushItems(VAULT_SIDE, slot)
-        if not moved or moved == 0 then break end
-        totalMoved = totalMoved + moved
-      end
-
-      if totalMoved > 0 then
-        local itemTotal = value * totalMoved
-        totalValue = totalValue + itemTotal
-        table.insert(itemsFound, {name = item.name, count = totalMoved, value = itemTotal})
-      end
+      local itemTotal = value * item.count
+      totalValue = totalValue + itemTotal
+      table.insert(itemsFound, {name = item.name, count = item.count, value = itemTotal})
+      -- NOT: Itemleri silmiyoruz, Kasa senin gercek hazinen olarak kalmali.
+      -- Sadece SAYIYORUZ. Amaayni itemin tekrar sayilmamasi icin,
+      -- bir "sayilan miktar" defteri tutmamiz gerekiyor (asagida).
     end
   end
 
+  return totalValue, itemsFound
+end
+
+-- Daha once sayilan toplam miktarlari hatirlayan defter (kalici dosyada saklanir)
+local function loadCountedLedger()
+  if fs.exists("counted_ledger.txt") then
+    local f = fs.open("counted_ledger.txt", "r")
+    local data = textutils.unserialize(f.readAll())
+    f.close()
+    return data or {}
+  end
+  return {}
+end
+
+local function saveCountedLedger(ledger)
+  local f = fs.open("counted_ledger.txt", "w")
+  f.write(textutils.serialize(ledger))
+  f.close()
+end
+
+-- Bu fonksiyon, Kasa'daki mevcut miktarlari, daha once sayilan miktarlarla
+-- karsilastirip SADECE YENI EKLENEN kismi hesaplar. Boylece Kasa hic bosaltilmasa
+-- (item'lar kalici olarak orada dursa) bile, ayni itemler tekrar tekrar sayilmaz.
+local function depositAndMoveItems()
+  local kasa = peripheral.wrap(KASA_SIDE)
+  if not kasa then return 0, {} end
+
+  local ledger = loadCountedLedger()
+  local items = kasa.list()
+
+  -- Kasa'daki her item turunden GERCEK toplam miktari hesapla
+  local currentTotals = {}
+  for slot, item in pairs(items) do
+    currentTotals[item.name] = (currentTotals[item.name] or 0) + item.count
+  end
+
+  local totalValue = 0
+  local itemsFound = {}
+
+  for itemName, currentCount in pairs(currentTotals) do
+    local value = ITEM_VALUES[itemName]
+    if value then
+      local previouslyCounted = ledger[itemName] or 0
+      local newAmount = currentCount - previouslyCounted
+
+      if newAmount > 0 then
+        local itemTotal = value * newAmount
+        totalValue = totalValue + itemTotal
+        table.insert(itemsFound, {name = itemName, count = newAmount, value = itemTotal})
+      end
+
+      -- defteri guncelle: artik bu kadarini saydik
+      ledger[itemName] = currentCount
+    end
+  end
+
+  saveCountedLedger(ledger)
   return totalValue, itemsFound
 end
 
@@ -117,8 +171,8 @@ local function depositScreen()
   print("  ATM - PARA YATIRMA")
   print("==========================================")
   print("")
-  print("Once hesap bilgilerini gir, SONRA itemler")
-  print("sandiktan alinip banka bakiyene eklenecek.")
+  print("Once giris yap, sonra itemleri atmani")
+  print("istiyecegiz.")
   print("")
 
   write("Kullanici adi: ")
@@ -126,7 +180,6 @@ local function depositScreen()
   write("Sifre: ")
   local password = read("*")
 
-  -- once giris dogrula (item tasimadan once kimligi kontrol et)
   local loginResp = sendToBank({action = "login", username = username, password = password})
 
   if not loginResp or loginResp.status ~= "ok" then
@@ -137,13 +190,55 @@ local function depositScreen()
     return
   end
 
-  -- KRITIK ADIM: itemleri SAYARKEN AYNI ANDA guvenli depoya tasi
-  -- boylece oyuncunun "once say, sonra geri al" yapmasi imkansiz
-  local totalValue, itemsFound = depositAndMoveItems()
+  -- giris basarili, once Vault'ta bekleyen eski itemler varsa
+  -- (kimseye ait olmayan) onlari temizle, hesaba yanlis yazilmasin
+  depositAndMoveItems() -- bu cagrinin sonucunu kullanmiyoruz, sadece Vault'u sifirliyoruz
+
+  print("")
+  print("Giris basarili, hosgeldin " .. username .. "!")
+  print("")
+  print("Simdi itemleri sandiga at, sistem 6 saniye")
+  print("boyunca surekli sayacak.")
+  print("")
+
+  -- 6 saniye boyunca her saniye Vault'u kontrol et,
+  -- akip giden itemleri kacirmamak icin kumulatif topla
+  local cumulativeValue = 0
+  local cumulativeItems = {}
+
+  for i = 6, 1, -1 do
+    term.setCursorPos(1, select(2, term.getCursorPos()))
+    write("Kalan sure: " .. i .. " saniye... (su ana kadar: " .. cumulativeValue .. " birim)   ")
+
+    local roundValue, roundItems = depositAndMoveItems()
+    if roundValue > 0 then
+      cumulativeValue = cumulativeValue + roundValue
+      for _, item in ipairs(roundItems) do
+        table.insert(cumulativeItems, item)
+      end
+    end
+
+    sleep(1)
+  end
+
+  -- son bir kontrol daha (son saniyede gelenleri de yakalamak icin)
+  local finalValue, finalItems = depositAndMoveItems()
+  if finalValue > 0 then
+    cumulativeValue = cumulativeValue + finalValue
+    for _, item in ipairs(finalItems) do
+      table.insert(cumulativeItems, item)
+    end
+  end
+
+  print("")
+  print("Sayim tamamlandi.")
+
+  local totalValue = cumulativeValue
+  local itemsFound = cumulativeItems
 
   if totalValue == 0 then
     print("")
-    print("Sandikta gecerli item bulunamadi, islem yapilmadi.")
+    print("Vault'ta gecerli item bulunamadi, islem iptal edildi.")
     print("Kabul edilen itemler:")
     for name, value in pairs(ITEM_VALUES) do
       print("  " .. name .. " = " .. value .. " birim")
@@ -155,14 +250,13 @@ local function depositScreen()
   end
 
   print("")
-  print("Sandiktan alinan ve guvenli depoya tasinan itemler:")
+  print("Vault'ta bulunan degerli itemler:")
   for _, item in ipairs(itemsFound) do
     print("  " .. item.name .. " x" .. item.count .. " = " .. item.value .. " birim")
   end
   print("")
   print("TOPLAM DEGER: " .. totalValue .. " birim")
 
-  -- itemler artik guvenli depoda, geri alinamaz. Simdi bakiyeyi guncelle
   local newBalance = loginResp.balance + totalValue
   local setResp = sendToBank({action = "admin_setbalance", username = username, amount = newBalance})
 
