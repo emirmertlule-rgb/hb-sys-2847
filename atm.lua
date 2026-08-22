@@ -1,24 +1,31 @@
 -- ==========================================
--- HANEDANOGULLARI ATM SISTEMI
+-- HANEDANOGULLARI ATM SISTEMI (v2 - Smart Chute)
 -- Fiziksel item <-> Dijital bakiye koprusu
+--
+-- KURULUM: [Bilgisayar] -> [Sandik] -> Smart Chute (redstone kontrollu) -> [Kasa]
+-- Smart Chute normalde KAPALI (redstone sinyali VAR).
+-- Para yatirma sirasinda kisa sureligine ACILIR (redstone sinyali YOK),
+-- itemler Kasa'ya akar, sonra tekrar KAPANIR.
+-- Boylece akis tamamen kontrollu, dupe riski yok.
 -- ==========================================
 
 local PROTOCOL = "j7yq39j4gwpoku9h38w409geoTYUHIJ9u0UR-troglfd-2847"
 local MODEM_SIDE = "back" -- ATM'nin modemi arkada
-local BANK_ID = 0 -- Merkez Banka ID'si
-local CHEST_SIDE = "top" -- yatirma/cekme sandiginin bagli oldugu yon, kendine gore ayarla
+local BANK_ID = 0 -- Merkez Banka ID'si, kendi kurulumuna gore ayarla
+local KASA_SIDE = "bottom" -- Kasa'nin (Smart Chute'un ALTINDAKI depo) bilgisayara gore yonu
+local REDSTONE_SIDE = "right" -- Smart Chute'a giden redstone sinyalinin cikis yonu
+local DEPOSIT_DURATION = 6 -- kac saniye boyunca chute acik kalsin
 
 rednet.open(MODEM_SIDE)
 
 -- ==========================================
 -- DEGER TABLOSU
--- Buraya istedigin itemleri ve degerlerini ekleyebilirsin
 -- ==========================================
 
 local ITEM_VALUES = {
   ["minecraft:copper_ingot"] = 0.2,
   ["minecraft:iron_ingot"] = 0.5,
-  ["create:zinc_ingot"] = 1.5, -- Create'in kendi zinc ingot'u (dogru modid'i JEI'den teyit et)
+  ["create:zinc_ingot"] = 1.5, -- Create'in kendi zinc ingot'u, dogru modid'i JEI'den teyit et
   ["minecraft:gold_ingot"] = 2,
   ["create:brass_ingot"] = 4,
   ["minecraft:emerald"] = 10,
@@ -27,45 +34,25 @@ local ITEM_VALUES = {
 }
 
 -- ==========================================
--- YARDIMCI FONKSIYONLAR
+-- CHUTE KONTROLU
 -- ==========================================
 
-local function getChest()
-  return peripheral.wrap(CHEST_SIDE)
+local function closeChute()
+  redstone.setOutput(REDSTONE_SIDE, true) -- sinyal VAR = Smart Chute KAPALI
 end
 
-local function countDepositValue()
-  local chest = getChest()
-  if not chest then return 0, {} end
-
-  local items = chest.list()
-  local totalValue = 0
-  local itemsFound = {}
-
-  for slot, item in pairs(items) do
-    local value = ITEM_VALUES[item.name]
-    if value then
-      local itemTotal = value * item.count
-      totalValue = totalValue + itemTotal
-      table.insert(itemsFound, {name = item.name, count = item.count, value = itemTotal})
-    end
-  end
-
-  return totalValue, itemsFound
+local function openChute()
+  redstone.setOutput(REDSTONE_SIDE, false) -- sinyal YOK = Smart Chute ACIK
 end
 
--- SENIN KURULUMUN: [Bilgisayar] -> [Sandik] -> Chute -> Belt -> [Kasa]
--- Chute ve Belt itemleri ZATEN OTOMATIK olarak Kasa'ya tasiyor.
--- Kod hicbir sey tasimiyor, SADECE KASA'YI OKUYUP SAYIYOR.
--- KASA_SIDE: bilgisayarin, Kasa'yi (son nokta) hangi yonden gordugu.
--- Eger Kasa bilgisayara dogrudan bagli degilse (araya Belt/baska blok giriyorsa),
--- bir Wired Modem ile Kasa'ya ayrica baglanman gerekebilir - bu durumda
--- KASA_SIDE yerine peripheral.getNames() ile bulunan ismi kullan.
-local KASA_SIDE = "bottom" -- kendi kurulumuna gore ayarla
+-- baslangicta chute'un kapali oldugundan emin ol
+closeChute()
 
--- Onceki sayimda Kasa'da olanlari hatirlamak icin (kumulatif fark hesaplamak yerine,
--- her seferinde Kasa'yi TAMAMEN BOSALTARAK sayiyoruz - en guvenli yontem)
-local function countAndClearKasa()
+-- ==========================================
+-- KASA SAYIMI
+-- ==========================================
+
+local function countKasa()
   local kasa = peripheral.wrap(KASA_SIDE)
   if not kasa then return 0, {} end
 
@@ -79,69 +66,9 @@ local function countAndClearKasa()
       local itemTotal = value * item.count
       totalValue = totalValue + itemTotal
       table.insert(itemsFound, {name = item.name, count = item.count, value = itemTotal})
-      -- NOT: Itemleri silmiyoruz, Kasa senin gercek hazinen olarak kalmali.
-      -- Sadece SAYIYORUZ. Amaayni itemin tekrar sayilmamasi icin,
-      -- bir "sayilan miktar" defteri tutmamiz gerekiyor (asagida).
     end
   end
 
-  return totalValue, itemsFound
-end
-
--- Daha once sayilan toplam miktarlari hatirlayan defter (kalici dosyada saklanir)
-local function loadCountedLedger()
-  if fs.exists("counted_ledger.txt") then
-    local f = fs.open("counted_ledger.txt", "r")
-    local data = textutils.unserialize(f.readAll())
-    f.close()
-    return data or {}
-  end
-  return {}
-end
-
-local function saveCountedLedger(ledger)
-  local f = fs.open("counted_ledger.txt", "w")
-  f.write(textutils.serialize(ledger))
-  f.close()
-end
-
--- Bu fonksiyon, Kasa'daki mevcut miktarlari, daha once sayilan miktarlarla
--- karsilastirip SADECE YENI EKLENEN kismi hesaplar. Boylece Kasa hic bosaltilmasa
--- (item'lar kalici olarak orada dursa) bile, ayni itemler tekrar tekrar sayilmaz.
-local function depositAndMoveItems()
-  local kasa = peripheral.wrap(KASA_SIDE)
-  if not kasa then return 0, {} end
-
-  local ledger = loadCountedLedger()
-  local items = kasa.list()
-
-  -- Kasa'daki her item turunden GERCEK toplam miktari hesapla
-  local currentTotals = {}
-  for slot, item in pairs(items) do
-    currentTotals[item.name] = (currentTotals[item.name] or 0) + item.count
-  end
-
-  local totalValue = 0
-  local itemsFound = {}
-
-  for itemName, currentCount in pairs(currentTotals) do
-    local value = ITEM_VALUES[itemName]
-    if value then
-      local previouslyCounted = ledger[itemName] or 0
-      local newAmount = currentCount - previouslyCounted
-
-      if newAmount > 0 then
-        local itemTotal = value * newAmount
-        totalValue = totalValue + itemTotal
-        table.insert(itemsFound, {name = itemName, count = newAmount, value = itemTotal})
-      end
-
-      -- defteri guncelle: artik bu kadarini saydik
-      ledger[itemName] = currentCount
-    end
-  end
-
-  saveCountedLedger(ledger)
   return totalValue, itemsFound
 end
 
@@ -156,7 +83,7 @@ local function sendToBank(msg)
 end
 
 -- ==========================================
--- ANA MENU
+-- EKRAN FONKSIYONLARI
 -- ==========================================
 
 local function clearScreen()
@@ -170,9 +97,6 @@ local function depositScreen()
   print("==========================================")
   print("  ATM - PARA YATIRMA")
   print("==========================================")
-  print("")
-  print("Once giris yap, sonra itemleri atmani")
-  print("istiyecegiz.")
   print("")
 
   write("Kullanici adi: ")
@@ -190,55 +114,35 @@ local function depositScreen()
     return
   end
 
-  -- giris basarili, once Vault'ta bekleyen eski itemler varsa
-  -- (kimseye ait olmayan) onlari temizle, hesaba yanlis yazilmasin
-  depositAndMoveItems() -- bu cagrinin sonucunu kullanmiyoruz, sadece Vault'u sifirliyoruz
+  -- yatirma oncesi Kasa'daki mevcut degeri kaydet (referans noktasi)
+  local beforeValue, _ = countKasa()
 
   print("")
   print("Giris basarili, hosgeldin " .. username .. "!")
   print("")
-  print("Simdi itemleri sandiga at, sistem 6 saniye")
-  print("boyunca surekli sayacak.")
+  print("Simdi itemleri sandiga at! Chute " .. DEPOSIT_DURATION .. " saniye acik kalacak.")
   print("")
 
-  -- 6 saniye boyunca her saniye Vault'u kontrol et,
-  -- akip giden itemleri kacirmamak icin kumulatif topla
-  local cumulativeValue = 0
-  local cumulativeItems = {}
+  openChute()
 
-  for i = 6, 1, -1 do
+  for i = DEPOSIT_DURATION, 1, -1 do
     term.setCursorPos(1, select(2, term.getCursorPos()))
-    write("Kalan sure: " .. i .. " saniye... (su ana kadar: " .. cumulativeValue .. " birim)   ")
-
-    local roundValue, roundItems = depositAndMoveItems()
-    if roundValue > 0 then
-      cumulativeValue = cumulativeValue + roundValue
-      for _, item in ipairs(roundItems) do
-        table.insert(cumulativeItems, item)
-      end
-    end
-
+    write("Kalan sure: " .. i .. " saniye...   ")
     sleep(1)
   end
 
-  -- son bir kontrol daha (son saniyede gelenleri de yakalamak icin)
-  local finalValue, finalItems = depositAndMoveItems()
-  if finalValue > 0 then
-    cumulativeValue = cumulativeValue + finalValue
-    for _, item in ipairs(finalItems) do
-      table.insert(cumulativeItems, item)
-    end
-  end
+  closeChute()
+  sleep(0.5) -- chute'un kapanip son itemlerin de dusmesi icin kisa bekleme
 
   print("")
-  print("Sayim tamamlandi.")
+  print("Chute kapatildi, sayiliyor...")
 
-  local totalValue = cumulativeValue
-  local itemsFound = cumulativeItems
+  local afterValue, afterItems = countKasa()
+  local totalValue = afterValue - beforeValue
 
-  if totalValue == 0 then
+  if totalValue <= 0 then
     print("")
-    print("Vault'ta gecerli item bulunamadi, islem iptal edildi.")
+    print("Yeni item algilanmadi, islem iptal edildi.")
     print("Kabul edilen itemler:")
     for name, value in pairs(ITEM_VALUES) do
       print("  " .. name .. " = " .. value .. " birim")
@@ -250,12 +154,7 @@ local function depositScreen()
   end
 
   print("")
-  print("Vault'ta bulunan degerli itemler:")
-  for _, item in ipairs(itemsFound) do
-    print("  " .. item.name .. " x" .. item.count .. " = " .. item.value .. " birim")
-  end
-  print("")
-  print("TOPLAM DEGER: " .. totalValue .. " birim")
+  print("YATIRILAN DEGER: " .. totalValue .. " birim")
 
   local newBalance = loginResp.balance + totalValue
   local setResp = sendToBank({action = "admin_setbalance", username = username, amount = newBalance})
@@ -283,8 +182,8 @@ local function withdrawScreen()
   print("")
   print("NOT: Bu ozellik henuz otomatik item verme")
   print("yapmiyor, sadece bakiyeni dusurur.")
-  print("Fiziksel item vermek icin ek bir Item Vault")
-  print("+ Deployer sistemi kurulmasi gerekiyor.")
+  print("Fiziksel item vermek icin ek bir Deployer")
+  print("sistemi kurulmasi gerekiyor.")
   print("")
   print("(devam etmek icin tusa bas)")
   os.pullEvent("key")
@@ -297,7 +196,7 @@ local function mainMenu()
     print("  HANEDANOGULLARI ATM")
     print("==========================================")
     print("")
-    print("1) Para Yatir (Sandiktaki itemleri yatir)")
+    print("1) Para Yatir")
     print("2) Para Cek")
     print("3) Kapat")
     print("")
@@ -309,6 +208,7 @@ local function mainMenu()
     elseif choice == "2" then
       withdrawScreen()
     elseif choice == "3" then
+      closeChute() -- guvenlik: cikista chute'un kapali oldugundan emin ol
       break
     end
   end
